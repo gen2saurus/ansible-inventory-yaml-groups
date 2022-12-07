@@ -81,6 +81,11 @@ from ansible.module_utils.six import string_types
 from ansible.module_utils._text import to_native
 from ansible.parsing.utils.addresses import parse_address
 from ansible.plugins.inventory import BaseFileInventoryPlugin, detect_range, expand_hostname_range
+try:
+    from functools import reduce
+except:
+    pass
+
 
 def is_sequence(obj):
     return isinstance(obj, Sequence) and not isinstance(obj, str)
@@ -114,6 +119,22 @@ def must_not_be_plugin(obj):
         raise AnsibleParserError('Standard configuration YAML file, not YAML groups inventory')
 
     return obj
+
+# From: https://rosettacode.org/wiki/Topological_sort#Python
+def toposort2(data):
+    for k, v in data.items():
+        v.discard(k) # Ignore self dependencies
+    extra_items_in_deps = reduce(set.union, data.values()) - set(data.keys())
+    data.update({item:set() for item in extra_items_in_deps})
+    while True:
+        ordered = set(item for item,dep in data.items() if not dep)
+        if not ordered:
+            break
+        yield (sorted(ordered))
+        data = {item: (dep - ordered) for item,dep in data.items()
+                if item not in ordered}
+    if data:
+        raise AnsibleParserError('Dependency loop for groups using include, require, or exclude')
 
 class InventoryModule(BaseFileInventoryPlugin):
     NAME = 'yaml-groups'
@@ -192,15 +213,24 @@ class InventoryModule(BaseFileInventoryPlugin):
 
     def _parse_groups(self, groups):
         must_be_dict(groups, name='groups')
-        for group_name in sorted(groups):
-            self._parse_group(group_name, groups[group_name])
+        graph = {}
 
-    def _parse_group(self, group_name, group_data):
+        for group_name in sorted(groups):
+            self._parse_group(group_name, groups[group_name], graph)
+
+        for group_set in toposort2(graph):
+            for group_name in group_set:
+                if group_name in groups:
+                    self._fill_group(group_name, groups[group_name])
+
+    def _parse_group(self, group_name, group_data, graph):
         must_be_dict(group_data, name=('groups/%s %s' % (group_name, group_data)))
         self.inventory.add_group(group_name)
         group = self.inventory.groups[group_name]
 
         all_group = self.inventory.groups['all']
+        deps = set()
+        graph[group_name] = deps
 
         if 'vars' in group_data:
             group_vars = must_be_dict(group_data['vars'], name='vars')
@@ -216,18 +246,36 @@ class InventoryModule(BaseFileInventoryPlugin):
 
         if 'include' in group_data:
             include_names = must_be_sequence(group_data['include'], name='include')
-            for include_name in include_names:
-                self._parse_group_include(group, include_name)
+            for group_name in include_names:
+                deps.add(group_name)
 
         if 'require' in group_data:
             require_names = must_be_sequence(group_data['require'], name='require')
-            for require_name in require_names:
-                self._parse_group_require(group, require_name)
+            for group_name in require_names:
+                deps.add(group_name)
 
         if 'exclude' in group_data:
             exclude_names = must_be_sequence(group_data['exclude'], name='exclude')
-            for exclude_name in exclude_names:
-                self._parse_group_exclude(group, exclude_name)
+            for group_name in exclude_names:
+                deps.add(group_name)
+
+    def _fill_group(self, group_name, group_data):
+        group = self.inventory.groups[group_name]
+
+        if 'include' in group_data:
+            include_names = must_be_sequence(group_data['include'], name='include')
+            for group_name in include_names:
+                self._parse_group_include(group, group_name)
+
+        if 'require' in group_data:
+            require_names = must_be_sequence(group_data['require'], name='require')
+            for group_name in require_names:
+                self._parse_group_require(group, group_name)
+
+        if 'exclude' in group_data:
+            exclude_names = must_be_sequence(group_data['exclude'], name='exclude')
+            for group_name in exclude_names:
+                self._parse_group_exclude(group, group_name)
 
     def _parse_group_include(self, group, include_name):
         if include_name not in self.inventory.groups:
